@@ -1,0 +1,20 @@
+definition_version: 2
+entities:
+  streamlit_app:
+    type: streamlit
+    identifier:
+      database: CUSTOMER_360_DB
+      schema: APP
+      name: CUSTOMER_360_APP
+    title: PolicySense AI
+    query_warehouse: COMPUTE_WH
+    compute_pool: SYSTEM_COMPUTE_POOL_CPU
+    run_mode: SpcsOnly
+    execute_as: OWNER
+    main_file: streamlit_app.py
+    artifact_repositories:
+      - SNOWFLAKE.SNOWPARK.ANACONDA_SHARED_REPOSITORY
+    artifacts:
+      - pyproject.toml
+      - streamlit_app.py
+      - .streamlit/config.toml
