@@ -13,7 +13,7 @@ create or replace dynamic table CUSTOMER_360_DB.CURATED.CALL_TRANSCRIPTS_ENRICHE
 	EXTRACTED_RESOLUTION,
 	CHURN_INDICATOR,
 	RAW_JSON
-) target_lag = '1 hour' refresh_mode = AUTO initialize = ON_CREATE warehouse = COMPUTE_WH
+) target_lag = '1 hour' refresh_mode = FULL initialize = ON_CREATE warehouse = COMPUTE_WH
  as
 SELECT 
     t.transcript_id,

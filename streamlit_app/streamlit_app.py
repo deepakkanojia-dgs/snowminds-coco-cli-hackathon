@@ -1,10 +1,68 @@
 import os
+import json
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(page_title="PolicySense AI", page_icon="🎯", layout="wide")
+
+def parse_ai_response(raw):
+    """Extract clean text from AI_COMPLETE response."""
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            choices = parsed.get("choices", [])
+            if choices:
+                msg = choices[0]
+                text = msg.get("messages", msg.get("message", {}).get("content", text))
+            else:
+                text = parsed.get("message", parsed.get("content", text))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if isinstance(text, str):
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        text = text.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"')
+    return text
+
+
+def call_ai(conn, prompt):
+    """Call AI_COMPLETE and return parsed response."""
+    response_df = conn.query("SELECT AI_COMPLETE('mistral-large3', :1) AS response", params=[prompt])
+    return parse_ai_response(response_df.iloc[0]["RESPONSE"])
+
+
+st.set_page_config(page_title="PolicySense AI | Customer 360", page_icon="🎯", layout="wide")
 
 conn = st.connection("snowflake", ttl=os.getenv("SNOWFLAKE_CONNECTION_TTL"))
+
+# --- ROLE-BASED PROMPT CONFIGURATION ---
+ROLE_CONFIGS = {
+    "Relationship Manager": {
+        "icon": "🤝",
+        "focus": "relationship building, upsell/cross-sell opportunities, client retention, and personalized engagement strategies",
+        "tone": "consultative and relationship-focused. Frame insights as talking points for client meetings.",
+    },
+    "Claims Team": {
+        "icon": "📋",
+        "focus": "claims history, resolution timelines, fraud indicators, settlement patterns, and process efficiency",
+        "tone": "precise and process-oriented. Prioritize claim statuses and resolution bottlenecks.",
+    },
+    "Retention Team": {
+        "icon": "🛡️",
+        "focus": "churn risk factors, sentiment trends, service recovery opportunities, and retention interventions",
+        "tone": "urgent and action-oriented. Lead with churn signals, quantify revenue at risk.",
+    },
+}
+
+RESPONSE_RULES = """RESPONSE FORMAT RULES (MUST FOLLOW):
+- Be CONCISE. Max 6-10 lines of text plus one table if needed.
+- When listing multiple customers, use a simple markdown table with max 4-5 columns.
+- Do NOT use <br> tags or HTML. Use plain markdown only.
+- Do NOT add long scripts, talking points, or multi-paragraph explanations.
+- Lead with a 1-line summary answer, then the table, then 2-3 bullet action items max.
+- Use 🔴 🟡 🟢 for risk/sentiment status."""
 
 
 @st.cache_data(ttl=300)
@@ -24,12 +82,12 @@ def load_nba(customer_id):
 
 @st.cache_data(ttl=300)
 def load_transcripts(customer_id):
-    return conn.query("SELECT transcript_id, call_date, call_reason, ROUND(sentiment_score, 3) AS sentiment_score, call_summary, extracted_complaint, churn_indicator FROM CUSTOMER_360_DB.CURATED.CALL_TRANSCRIPTS_ENRICHED WHERE customer_id = :1 ORDER BY call_date DESC", params=[customer_id])
+    return conn.query("SELECT transcript_id, call_date, call_reason, CASE sentiment_score:categories[0]:sentiment::STRING WHEN 'positive' THEN 1.0 WHEN 'mixed' THEN 0.0 WHEN 'negative' THEN -1.0 ELSE NULL END AS sentiment_score, call_summary, extracted_complaint, churn_indicator FROM CUSTOMER_360_DB.CURATED.CALL_TRANSCRIPTS_ENRICHED WHERE customer_id = :1 ORDER BY call_date DESC", params=[customer_id])
 
 
 @st.cache_data(ttl=300)
 def load_interactions(customer_id):
-    return conn.query("SELECT interaction_date, channel, interaction_type, subject, ROUND(sentiment_score, 3) AS sentiment_score, resolved FROM CUSTOMER_360_DB.CURATED.INTERACTIONS_ENRICHED WHERE customer_id = :1 ORDER BY interaction_date DESC", params=[customer_id])
+    return conn.query("SELECT interaction_date, channel, interaction_type, subject, CASE sentiment_score:categories[0]:sentiment::STRING WHEN 'positive' THEN 1.0 WHEN 'mixed' THEN 0.0 WHEN 'negative' THEN -1.0 ELSE NULL END AS sentiment_score, resolved FROM CUSTOMER_360_DB.CURATED.INTERACTIONS_ENRICHED WHERE customer_id = :1 ORDER BY interaction_date DESC", params=[customer_id])
 
 
 @st.cache_data(ttl=300)
@@ -62,6 +120,9 @@ with st.sidebar:
     st.title("Customer 360")
     st.caption("Insurance | Next Best Action")
     st.divider()
+    user_role = st.selectbox("Who's asking?", options=list(ROLE_CONFIGS.keys()), index=0)
+    st.caption(f"{ROLE_CONFIGS[user_role]['icon']} AI responses tuned for {user_role}")
+    st.divider()
     view_mode = st.radio("View", ["All Customers", "Individual Customer"], index=0)
     if view_mode == "Individual Customer":
         all_df = load_all_customers()
@@ -69,7 +130,7 @@ with st.sidebar:
         selected_name = st.selectbox("Select Customer", options=list(customer_options.keys()), index=0)
         selected_id = customer_options[selected_name]
     st.divider()
-    if st.button("Refresh Data", width="stretch"):
+    if st.button("Refresh Data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
@@ -77,7 +138,8 @@ with st.sidebar:
 # ALL CUSTOMERS VIEW
 # ===================================================================
 if view_mode == "All Customers":
-    st.title("Customer 360 — Portfolio Overview")
+    st.title("🎯 PolicySense AI")
+    st.caption("Customer 360 — Portfolio Overview  •  Powered by Semantic View `CUSTOMER_360_DB.ANALYTICS.CUSTOMER_360_SV`")
     all_df = load_all_customers()
 
     # --- FILTERS ---
@@ -92,7 +154,6 @@ if view_mode == "All Customers":
     with filter_col4:
         sentiment_range = st.slider("Sentiment Range", min_value=-1.0, max_value=1.0, value=(-1.0, 1.0), step=0.1)
 
-    # Apply filters
     filtered_df = all_df[(all_df["CHURN_RISK"].isin(churn_filter)) & (all_df["CUSTOMER_SEGMENT"].isin(segment_filter)) & (all_df["OVERALL_SENTIMENT_SCORE"] >= sentiment_range[0]) & (all_df["OVERALL_SENTIMENT_SCORE"] <= sentiment_range[1])]
     if city_filter:
         filtered_df = filtered_df[filtered_df["CITY"].isin(city_filter)]
@@ -114,7 +175,7 @@ if view_mode == "All Customers":
         with ai_header_col1:
             st.subheader("Ask AI about your entire customer portfolio")
         with ai_header_col2:
-            if st.button("New Chat", width="stretch", key="new_chat_portfolio"):
+            if st.button("New Chat", use_container_width=True, key="new_chat_portfolio"):
                 st.session_state["portfolio_chat"] = []
                 st.rerun()
 
@@ -125,83 +186,76 @@ if view_mode == "All Customers":
                 lines.append(f"- {row['FULL_NAME']} (ID:{row['CUSTOMER_ID']}) | Segment:{row['CUSTOMER_SEGMENT']} | Churn:{row['CHURN_RISK']} | Premium:Rs {row['TOTAL_ANNUAL_PREMIUM']:,.0f} | Sentiment:{row['OVERALL_SENTIMENT_SCORE']:.3f} | Claims:{row['TOTAL_CLAIMS']} | Unresolved:{row['UNRESOLVED_ISSUES']} | Policies:{row['POLICY_TYPES'] or 'None'} | City:{row['CITY']} | NBA:{str(row['RECOMMENDED_ACTION'])[:150]}")
             return "\n".join(lines)
 
-        PORTFOLIO_SUGGESTIONS = {
-            "Who are my top churn risks?": "Which customers are at highest risk of churning and why? List them with their key risk factors.",
-            "Revenue at risk": "What is the total premium revenue at risk from high-churn customers? Break it down by customer.",
-            "Action priorities": "Prioritize the next best actions across all customers. Which ones should we tackle first and why?",
-            "Segment analysis": "Compare customer segments by sentiment, claims, and churn risk. Which segment needs the most attention?",
-            "Upsell opportunities": "Which customers have the best upsell or cross-sell potential? What should we offer them?",
-        }
+        PORTFOLIO_SUGGESTIONS = [
+            "Which customers are at highest risk of churning?",
+            "What is the total premium revenue at risk?",
+            "Compare segments by sentiment and churn risk",
+            "Which customers have the best upsell potential?",
+            "Prioritize next best actions across all customers",
+        ]
 
         if "portfolio_chat" not in st.session_state:
             st.session_state["portfolio_chat"] = []
 
-        if not st.session_state["portfolio_chat"]:
-            selected_suggestion = st.pills("Try asking:", list(PORTFOLIO_SUGGESTIONS.keys()), label_visibility="collapsed")
-            if selected_suggestion:
-                st.session_state["portfolio_chat"].append({"role": "user", "content": PORTFOLIO_SUGGESTIONS[selected_suggestion]})
-                st.rerun()
+        # Display chat history
+        for msg in st.session_state["portfolio_chat"]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
-        with st.form("portfolio_ask_form", clear_on_submit=True):
-            prompt_col, btn_col = st.columns([5, 1])
-            with prompt_col:
-                prompt = st.text_input("Question", placeholder="Ask about all customers...", label_visibility="collapsed")
-            with btn_col:
-                submitted = st.form_submit_button("Ask", width="stretch")
+        # Suggestion chips (always visible)
+        st.caption("Quick questions:")
+        pill_cols = st.columns(len(PORTFOLIO_SUGGESTIONS))
+        pill_clicked = None
+        for i, suggestion in enumerate(PORTFOLIO_SUGGESTIONS):
+            with pill_cols[i]:
+                if st.button(suggestion, key=f"port_pill_{i}", use_container_width=True):
+                    pill_clicked = suggestion
 
-        if submitted and prompt:
-            st.session_state["portfolio_chat"].append({"role": "user", "content": prompt})
-            with st.spinner("Analyzing portfolio..."):
-                portfolio_context = build_portfolio_context()
-                system_prompt = f"You are an insurance customer success AI assistant with access to the full customer portfolio. Answer questions based ONLY on the data provided. Be specific, reference actual customer names, numbers, and data. Provide actionable insights.\n\n{portfolio_context}"
-                full_prompt = f"{system_prompt}\n\nUser Question: {prompt}"
-                response_df = conn.query("SELECT AI_COMPLETE('mistral-large2', :1) AS response", params=[full_prompt])
-                response = response_df.iloc[0]["RESPONSE"]
+        # Get user input - either from pills or chat input
+        user_input = pill_clicked or st.chat_input("Ask about all customers...", key="portfolio_input")
+
+        if user_input:
+            # Show user message
+            st.session_state["portfolio_chat"].append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.markdown(user_input)
+
+            # Generate and show AI response
+            with st.chat_message("assistant"):
+                with st.spinner("Analyzing..."):
+                    portfolio_context = build_portfolio_context()
+                    role_cfg = ROLE_CONFIGS[user_role]
+                    system_prompt = f"You are PolicySense AI. Responding to: {user_role}.\nTone: {role_cfg['tone']}\nFocus: {role_cfg['focus']}\n{RESPONSE_RULES}\nData:\n{portfolio_context}"
+                    full_prompt = f"{system_prompt}\n\nQuestion: {user_input}"
+                    response = call_ai(conn, full_prompt)
+                st.markdown(response)
             st.session_state["portfolio_chat"].append({"role": "assistant", "content": response})
-            st.rerun()
-
-        if st.session_state["portfolio_chat"]:
-            st.divider()
-            show_history = st.toggle("Show chat history", value=True, key="toggle_portfolio_history")
-            if show_history:
-                for msg in st.session_state["portfolio_chat"]:
-                    with st.chat_message(msg["role"]):
-                        st.write(msg["content"])
 
     with tab_dashboard:
         st.subheader("Portfolio Analytics")
-
-        # Row 1: Churn Risk Distribution + Segment Breakdown
         chart_col1, chart_col2 = st.columns(2)
-
         with chart_col1:
             st.markdown("**Churn Risk Distribution**")
             churn_counts = filtered_df["CHURN_RISK"].value_counts().reset_index()
             churn_counts.columns = ["Churn Risk", "Count"]
-            st.bar_chart(churn_counts, x="Churn Risk", y="Count", color="Churn Risk", horizontal=False)
-
+            st.bar_chart(churn_counts, x="Churn Risk", y="Count", color="Churn Risk")
         with chart_col2:
             st.markdown("**Customers by Segment**")
             segment_counts = filtered_df["CUSTOMER_SEGMENT"].value_counts().reset_index()
             segment_counts.columns = ["Segment", "Count"]
             st.bar_chart(segment_counts, x="Segment", y="Count", color="Segment")
 
-        # Row 2: Premium by Segment + Sentiment Distribution
         chart_col3, chart_col4 = st.columns(2)
-
         with chart_col3:
             st.markdown("**Total Premium by Segment**")
             premium_by_seg = filtered_df.groupby("CUSTOMER_SEGMENT")["TOTAL_ANNUAL_PREMIUM"].sum().reset_index()
             premium_by_seg.columns = ["Segment", "Total Premium"]
             st.bar_chart(premium_by_seg, x="Segment", y="Total Premium", color="Segment")
-
         with chart_col4:
             st.markdown("**Sentiment Score Distribution**")
             st.scatter_chart(filtered_df, x="TOTAL_ANNUAL_PREMIUM", y="OVERALL_SENTIMENT_SCORE", color="CHURN_RISK", size="TOTAL_CLAIMS")
 
-        # Row 3: Premium vs Sentiment scatter + City distribution
         chart_col5, chart_col6 = st.columns(2)
-
         with chart_col5:
             st.markdown("**Claims by Status (All Customers)**")
             claims_data = pd.DataFrame({
@@ -209,21 +263,19 @@ if view_mode == "All Customers":
                 "Count": [int(filtered_df["TOTAL_CLAIMS"].sum() - filtered_df["REJECTED_CLAIMS"].sum() - filtered_df["PENDING_CLAIMS"].sum()), int(filtered_df["PENDING_CLAIMS"].sum()), int(filtered_df["REJECTED_CLAIMS"].sum())]
             })
             st.bar_chart(claims_data, x="Status", y="Count", color="Status")
-
         with chart_col6:
             st.markdown("**Top Cities by Customer Count**")
             city_counts = filtered_df["CITY"].value_counts().head(10).reset_index()
             city_counts.columns = ["City", "Customers"]
             st.bar_chart(city_counts, x="City", y="Customers")
 
-        # Row 4: Tenure vs Sentiment
         st.markdown("**Customer Tenure vs Sentiment (bubble = premium)**")
         st.scatter_chart(filtered_df, x="TENURE_MONTHS", y="OVERALL_SENTIMENT_SCORE", color="CUSTOMER_SEGMENT", size="TOTAL_ANNUAL_PREMIUM")
 
     with tab_table:
         st.dataframe(
             filtered_df[["CUSTOMER_ID", "FULL_NAME", "CUSTOMER_SEGMENT", "CHURN_RISK", "TOTAL_ANNUAL_PREMIUM", "OVERALL_SENTIMENT_SCORE", "TOTAL_CLAIMS", "UNRESOLVED_ISSUES", "CITY", "PREFERRED_CHANNEL"]],
-            hide_index=True, width="stretch",
+            hide_index=True, use_container_width=True,
             column_config={"TOTAL_ANNUAL_PREMIUM": st.column_config.NumberColumn("Premium", format="Rs %.0f"), "OVERALL_SENTIMENT_SCORE": st.column_config.NumberColumn("Sentiment", format="%.3f")},
         )
 
@@ -231,7 +283,7 @@ if view_mode == "All Customers":
         st.subheader("Recommended Actions for All Customers")
         nba_display = filtered_df[["FULL_NAME", "CUSTOMER_SEGMENT", "CHURN_RISK", "TOTAL_ANNUAL_PREMIUM", "RECOMMENDED_ACTION"]].copy()
         nba_display.columns = ["Customer", "Segment", "Churn Risk", "Premium", "Recommended Action"]
-        st.dataframe(nba_display, hide_index=True, width="stretch", column_config={"Premium": st.column_config.NumberColumn(format="Rs %.0f")})
+        st.dataframe(nba_display, hide_index=True, use_container_width=True, column_config={"Premium": st.column_config.NumberColumn(format="Rs %.0f")})
 
 # ===================================================================
 # INDIVIDUAL CUSTOMER VIEW
@@ -244,9 +296,12 @@ else:
 
     cust = cust_df.iloc[0]
 
+    st.title("🎯 PolicySense AI")
+    st.caption(f"Individual Customer View  •  Powered by Semantic View `CUSTOMER_360_DB.ANALYTICS.CUSTOMER_360_SV`")
+
     col_h1, col_h2 = st.columns([3, 1])
     with col_h1:
-        st.title(f"{cust['FULL_NAME']}")
+        st.header(f"{cust['FULL_NAME']}")
         st.caption(f"{cust['CUSTOMER_SEGMENT']} | {cust['CITY']}, {cust['STATE']} | Tenure: {cust['TENURE_MONTHS']} months | ID: {selected_id}")
     with col_h2:
         st.markdown(f"### Churn Risk: {churn_badge(cust['CHURN_RISK'])}")
@@ -275,7 +330,7 @@ else:
             st.subheader("Ask about this customer")
         with chat_header_col2:
             chat_key = f"chat_{selected_id}"
-            if st.button("New Chat", width="stretch", key=f"new_chat_{selected_id}"):
+            if st.button("New Chat", use_container_width=True, key=f"new_chat_{selected_id}"):
                 st.session_state[chat_key] = []
                 st.rerun()
 
@@ -296,51 +351,50 @@ else:
                 context += f"\n\nNext Best Action: {nba_ctx.iloc[0]['RECOMMENDED_ACTION']}"
             return context
 
-        SUGGESTIONS = {
-            "Why is this customer at risk?": "Why is this customer at risk of churning?",
-            "What should we do next?": "What is the recommended next best action and why?",
-            "Summarize recent calls": "Summarize the recent call interactions and their sentiment",
-            "Upsell opportunities": "What upsell or cross-sell opportunities exist for this customer?",
-        }
+        CUSTOMER_SUGGESTIONS = [
+            "Why is this customer at risk of churning?",
+            "What should we do next for this customer?",
+            "Summarize recent call interactions",
+            "What upsell opportunities exist?",
+        ]
 
         if chat_key not in st.session_state:
             st.session_state[chat_key] = []
 
-        if not st.session_state[chat_key]:
-            selected_suggestion = st.pills("Try asking:", list(SUGGESTIONS.keys()), label_visibility="collapsed")
-            if selected_suggestion:
-                st.session_state[chat_key].append({"role": "user", "content": SUGGESTIONS[selected_suggestion]})
-                st.rerun()
+        # Display chat history
+        for msg in st.session_state[chat_key]:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
 
-        with st.form(f"ask_form_{selected_id}", clear_on_submit=True):
-            prompt_col, btn_col = st.columns([5, 1])
-            with prompt_col:
-                prompt = st.text_input("Question", placeholder="Ask about this customer...", label_visibility="collapsed")
-            with btn_col:
-                submitted = st.form_submit_button("Ask", width="stretch")
+        # Suggestion chips
+        st.caption("Quick questions:")
+        pill_cols = st.columns(len(CUSTOMER_SUGGESTIONS))
+        pill_clicked = None
+        for i, suggestion in enumerate(CUSTOMER_SUGGESTIONS):
+            with pill_cols[i]:
+                if st.button(suggestion, key=f"cust_pill_{selected_id}_{i}", use_container_width=True):
+                    pill_clicked = suggestion
 
-        if submitted and prompt:
-            st.session_state[chat_key].append({"role": "user", "content": prompt})
-            with st.spinner("Thinking..."):
-                customer_context = build_customer_context()
-                system_prompt = f"You are an insurance customer success AI assistant. Answer questions based ONLY on this data. Be specific and actionable.\n\n{customer_context}"
-                full_prompt = f"{system_prompt}\n\nUser Question: {prompt}"
-                response_df = conn.query("SELECT AI_COMPLETE('mistral-large2', :1) AS response", params=[full_prompt])
-                response = response_df.iloc[0]["RESPONSE"]
+        # Get user input
+        user_input = pill_clicked or st.chat_input("Ask about this customer...", key=f"cust_input_{selected_id}")
+
+        if user_input:
+            st.session_state[chat_key].append({"role": "user", "content": user_input})
+            with st.chat_message("user"):
+                st.markdown(user_input)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking..."):
+                    customer_context = build_customer_context()
+                    role_cfg = ROLE_CONFIGS[user_role]
+                    system_prompt = f"You are PolicySense AI. Responding to: {user_role}.\nTone: {role_cfg['tone']}\nFocus: {role_cfg['focus']}\n{RESPONSE_RULES}\nData:\n{customer_context}"
+                    full_prompt = f"{system_prompt}\n\nQuestion: {user_input}"
+                    response = call_ai(conn, full_prompt)
+                st.markdown(response)
             st.session_state[chat_key].append({"role": "assistant", "content": response})
-            st.rerun()
-
-        if st.session_state[chat_key]:
-            st.divider()
-            show_history = st.toggle("Show chat history", value=True, key=f"toggle_history_{selected_id}")
-            if show_history:
-                for msg in st.session_state[chat_key]:
-                    with st.chat_message(msg["role"]):
-                        st.write(msg["content"])
 
     with tab_timeline:
         st.subheader("Sentiment Over Time")
-        # Combine calls and interactions into a timeline
         transcripts_tl = load_transcripts(selected_id)
         interactions_tl = load_interactions(selected_id)
 
@@ -355,7 +409,6 @@ else:
         if timeline_data:
             tl_df = pd.DataFrame(timeline_data).sort_values("Date")
             st.line_chart(tl_df, x="Date", y="Sentiment", color="Source")
-
             st.divider()
             st.markdown("**Interaction Timeline**")
             for _, row in tl_df.iterrows():
@@ -364,7 +417,6 @@ else:
         else:
             st.info("No interactions recorded to show timeline.")
 
-        # Policy breakdown pie-like chart
         policies_viz = load_policies(selected_id)
         if not policies_viz.empty:
             st.divider()
@@ -401,21 +453,21 @@ else:
         if interactions.empty:
             st.info("No interactions recorded for this customer.")
         else:
-            st.dataframe(interactions, hide_index=True, width="stretch", column_config={"SENTIMENT_SCORE": st.column_config.NumberColumn(format="%.3f"), "RESOLVED": st.column_config.CheckboxColumn()})
+            st.dataframe(interactions, hide_index=True, use_container_width=True, column_config={"SENTIMENT_SCORE": st.column_config.NumberColumn(format="%.3f"), "RESOLVED": st.column_config.CheckboxColumn()})
 
     with tab_policies:
         policies = load_policies(selected_id)
         if policies.empty:
             st.info("No policies found.")
         else:
-            st.dataframe(policies, hide_index=True, width="stretch", column_config={"PREMIUM_AMOUNT": st.column_config.NumberColumn("Premium", format="Rs %.0f"), "COVERAGE_AMOUNT": st.column_config.NumberColumn("Coverage", format="Rs %.0f")})
+            st.dataframe(policies, hide_index=True, use_container_width=True, column_config={"PREMIUM_AMOUNT": st.column_config.NumberColumn("Premium", format="Rs %.0f"), "COVERAGE_AMOUNT": st.column_config.NumberColumn("Coverage", format="Rs %.0f")})
 
     with tab_claims:
         claims = load_claims(selected_id)
         if claims.empty:
             st.info("No claims found.")
         else:
-            st.dataframe(claims, hide_index=True, width="stretch", column_config={"CLAIM_AMOUNT": st.column_config.NumberColumn("Claimed", format="Rs %.0f"), "APPROVED_AMOUNT": st.column_config.NumberColumn("Approved", format="Rs %.0f"), "SATISFACTION_SCORE": st.column_config.NumberColumn("Satisfaction", format="%d/5")})
+            st.dataframe(claims, hide_index=True, use_container_width=True, column_config={"CLAIM_AMOUNT": st.column_config.NumberColumn("Claimed", format="Rs %.0f"), "APPROVED_AMOUNT": st.column_config.NumberColumn("Approved", format="Rs %.0f"), "SATISFACTION_SCORE": st.column_config.NumberColumn("Satisfaction", format="%d/5")})
 
     with tab_profile:
         col1, col2 = st.columns(2)

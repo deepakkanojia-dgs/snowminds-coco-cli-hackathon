@@ -1,0 +1,1 @@
+create or replace stream CUSTOMER_360_DB.RAW.LOAD_COMPLETE_STREAM on table CUSTOMER_LOAD_COMPLETE;
